@@ -57,6 +57,7 @@ $esd       = Join-Path $dir 'win11.esd'   # catalog fallback, deleted once $medi
 $media     = Join-Path $dir 'media'       # setup media built from the ESD
 $logFile   = Join-Path $dir 'upgrade.log'
 $stateFile = Join-Path $dir 'state.json'
+$report    = Join-Path $dir 'REPORT.txt'   # why it stopped and what to do, see Write-Report
 $bt        = Join-Path $env:SystemDrive '$WINDOWS.~BT\Sources'
 
 # Workstations only. WinNT = workstation, ServerNT = server, LanManNT = domain controller.
@@ -432,6 +433,66 @@ function Restart-Now([string]$why) {
     exit 0
 }
 
+# Why the upgrade stopped and what to do, in plain words, for whoever sits at this PC: C:\Win11Upgrade\REPORT.txt.
+# Written when a run gives up or cannot start, removed when a new run starts. Never throws.
+function Write-Report([string]$why) {
+    try {
+        # Same list as "If something fails" in the README. Every row whose pattern matches the reason is shown.
+        $advice = @(
+            @('0xC1900208', 'An app or driver blocks the upgrade. Nothing is uninstalled for you.', 'Update or uninstall the app or driver named on the "Blocking" line in upgrade.log, then run the command again.'),
+            @('0xC190020E|0x80070070|GB free', 'Not enough disk space.', 'Free space on C: (30 GB or more), then run the command again.'),
+            @('0xC1900104|system disk|boot partition|EFI|BCD|BIOS mode|UEFI mode|NTFS|audit mode', 'The boot layout of the disk is not right: EFI partition missing, too full or not FAT32, boot files on another disk, or a disk style that does not match the firmware. Typical after cloning a disk.', 'Fix the partition layout (for example free space on the EFI partition, or remove the old cloned disk), then run the command again. The BOOT lines in upgrade.log show the details.'),
+            @('0xC1900204|0xC1900215|language', 'The install media has no image for this edition and language.', 'Not fixable by retrying. Only Dutch and English are supported.'),
+            @('0xC1900200|0xC1900202', 'Setup still rejected the hardware, the unsupported hardware bypass did not apply.', 'Read the SetupDiag lines in upgrade.log.'),
+            @('get install media', 'Neither the Microsoft ISO download nor the Media Creation Tool catalog worked, the download broke, or building the media failed.', 'Check the internet and that microsoft.com is reachable, then run the command again. For a DISM error see C:\Windows\Logs\DISM\dism.log.'),
+            @('Rolled back', 'Windows 11 was installed but did not start. Windows 10 came back with everything as before.', 'Read the SetupDiag lines in upgrade.log, fix what it names, then run the command again.'),
+            @('SSE4|only x64|not a workstation|not Windows 10|Enterprise', 'This PC can never run Windows 11 this way (32-bit Windows, CPU without SSE4.2, Enterprise edition, or not Windows 10).', 'Nothing to fix.')
+        )
+        $hits = @($advice | Where-Object { $why -match $_[0] })
+        if (-not $hits) { $hits = @(, @('', 'No known cause.', 'Read upgrade.log from the bottom up: the lines before FAILED show what went wrong, SetupDiag lines (if any) name the cause.')) }
+
+        $lines = @('WINDOWS 11 UPGRADE DID NOT FINISH', '', "PC:      $env:COMPUTERNAME", "When:    $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')",
+            "Script:  version $version", '', 'Why it stopped:', "  $why", '')
+        foreach ($h in $hits) { $lines += "What it means: $($h[1])", "What to do:    $($h[2])", '' }
+        if ($ready) {   # the readiness check of this run, when there was one
+            $lines += 'This PC:',
+                "  Windows $($ready.edition) $($ready.displayVersion) build $($ready.build).$($ready.ubr), language $($ready.lang)",
+                "  $($ready.cpu) | TPM $($ready.tpm) | $($ready.firmware) | Secure Boot $($ready.secureBoot) | RAM $($ready.ramGB) GB | free $($ready.freeGB) GB",
+                "  Check: $($ready.verdict)$(if ($ready.hwFails) { ', hardware: ' + ($ready.hwFails -join ', ') })$(if ($ready.blockers) { ', blockers: ' + ($ready.blockers -join ', ') })"
+            foreach ($w in $ready.layoutWarn) { $lines += "  Boot warning: $w" }
+            $lines += ''
+        }
+        $blocks = @(Get-CompatBlocks)
+        if ($blocks) { $lines += 'Blocking apps or drivers (setup says):'; foreach ($b in $blocks) { $lines += "  $b" }; $lines += '' }
+        $lines += "Setup attempts: $($state.attempts)", '', 'Logs on this PC:',
+            "  $logFile   (this script, newest lines at the bottom)",
+            "  $dir\logs   (setup's own logs, SetupDiagResults.xml)",
+            "  $bt\Panther   (setuperr.log, setupact.log)", '',
+            'Help and bug reports: https://github.com/Monstertov/windows-inplace-upgrade',
+            '  The README there explains every message. To report a bug, open an issue there and attach',
+            "  $dir\bugreport.zip: this report, upgrade.log and setup's error files. They contain the PC name",
+            '  and hardware details, look through them before you share them.'
+        Set-Content $report $lines -Encoding UTF8
+        Log "Why it stopped and what to do: $report"
+    } catch { Log "REPORT.txt not written: $($_.Exception.Message)" }
+}
+
+# What a bug report needs in one file, C:\Win11Upgrade\bugreport.zip: REPORT.txt, upgrade.log, state.json and setup's
+# small result files. setupact.log (often 100+ MB) stays in $bt\Panther. Never throws.
+function Save-BugReport {
+    $zip = Join-Path $dir 'bugreport.zip'; $stage = Join-Path $dir 'bugreport'
+    try {
+        Remove-Item $stage, $zip -Recurse -Force -ErrorAction SilentlyContinue
+        $null = New-Item -ItemType Directory $stage
+        $files = [ordered]@{ 'REPORT.txt' = $report; 'upgrade.log' = $logFile; 'state.json' = $stateFile; 'SetupDiagResults.xml' = "$dir\logs\SetupDiagResults.xml"
+            'setuperr.log' = "$bt\Panther\setuperr.log"; 'rollback-setuperr.log' = "$bt\Rollback\setuperr.log" }
+        foreach ($k in $files.Keys) { if (Test-Path $files[$k]) { Copy-Item $files[$k] (Join-Path $stage $k) } }
+        Get-ChildItem "$bt\Panther" -Filter 'CompatData*.xml' -ErrorAction SilentlyContinue | Copy-Item -Destination $stage
+        Compress-Archive -Path "$stage\*" -DestinationPath $zip -Force
+    } catch { Log "bugreport.zip not made: $($_.Exception.Message)" }
+    Remove-Item $stage -Recurse -Force -ErrorAction SilentlyContinue
+}
+
 # Done or given up: remove the task, the install media and the post-upgrade hook. The log stays.
 function Stop-Run([string]$result, [string]$why) {
     $state.phase = $result; Save-State
@@ -439,6 +500,7 @@ function Stop-Run([string]$result, [string]$why) {
     if ($result -eq 'failed') {
         Write-SetupErrors
         Log "Where to look: $logFile, the setup logs in $dir\logs and $bt\Panther (setuperr.log, setupact.log). Fix the cause, then run the command again to start over."
+        Write-Report $why; Save-BugReport
     }
     Remove-Item $iso, "$iso.sha256", $esd, "$esd.sha256", $media, "$dir\postoobe" -Recurse -Force -ErrorAction SilentlyContinue
     Complete-Task   # last: removing the task may end this run
@@ -778,6 +840,7 @@ if (-not $Worker) {
     Log 'Preparing the upgrade. Do NOT close this window yet, this takes a minute.'
     try { [Console]::ResetColor() } catch { }
     Log "==== Start on $env:COMPUTERNAME as $([Environment]::UserName), version $version ===="
+    Remove-Item $report, "$dir\bugreport.zip" -Force -ErrorAction SilentlyContinue   # from an earlier run
     if ($Window) { Log "Window $Window (PC time): setup and reboots only start inside it." }
     try {
         $task = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
@@ -801,7 +864,8 @@ if (-not $Worker) {
         $ready = Get-Readiness
         if ($ready.verdict -eq 'ALREADY_WIN11') { Close-Console $true 'Windows 11 is already installed, nothing to do. You can close this window.' }
         if ($ready.verdict -eq 'BLOCKED' -and -not ($ready.blockers.Count -eq 1 -and $ready.blockers[0] -like 'only*free*')) {
-            Close-Console $false "FAIL: this PC cannot upgrade: $($ready.blockers -join ', '). Nothing was changed, you can close this window."
+            Write-Report "Blocked: $($ready.blockers -join ', ')"; Save-BugReport
+            Close-Console $false "FAIL: this PC cannot upgrade: $($ready.blockers -join ', '). Nothing was changed, you can close this window. Why and what to do: $report"
         }
         Save-State
         Register-WorkerTask
@@ -812,7 +876,9 @@ if (-not $Worker) {
             throw 'the background task did not start'
         }
     } catch {
-        Close-Console $false "FAIL: $($_.Exception.Message). Nothing was changed, you can close this window. Log: $logFile"
+        $err = $_.Exception.Message
+        Write-Report "Could not start: $err"; Save-BugReport
+        Close-Console $false "FAIL: $err. Nothing was changed, you can close this window. Why and what to do: $report"
     }
     Close-Console $true "Started. The upgrade now runs in the background and the PC reboots by itself when needed. You can close this window. Log: $logFile"
 }
