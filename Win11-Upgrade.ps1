@@ -470,12 +470,17 @@ function Resolve-Iso([string]$name) {
     $sku = @($skus | Where-Object { $_.Language -eq $name })[0]
     if (-not $sku -or "$($sku.Id)" -notmatch '^\d+$') { throw "No SKU for $name." }
 
-    $r = (Get-Ms "${MsApi}GetProductDownloadLinksBySku?$q&productEditionId=undefined&SKU=$($sku.Id)" @{ Referer = 'https://www.microsoft.com/software-download/windows11' }).Content | ConvertFrom-Json
-    foreach ($o in $r.ProductDownloadOptions) {
-        if (-not $o.Uri) { continue }
-        $u = [uri]"$($o.Uri)"
-        if ($u.Scheme -ne 'https' -or -not $u.Host.EndsWith('.microsoft.com') -or $u.AbsolutePath -notmatch '/([^/]+_x64[^/]*\.iso)$') { continue }
-        return [pscustomobject]@{ url = "$($o.Uri)"; sha256 = $sha; file = $Matches[1] }
+    # Microsoft sometimes answers this call with an error and works a moment later.
+    for ($try = 1; $try -le 3; $try++) {
+        if ($try -gt 1) { Start-Sleep -Seconds 3 }
+        $r = (Get-Ms "${MsApi}GetProductDownloadLinksBySku?$q&productEditionId=undefined&SKU=$($sku.Id)" @{ Referer = 'https://www.microsoft.com/software-download/windows11' }).Content | ConvertFrom-Json
+        foreach ($o in $r.ProductDownloadOptions) {
+            if (-not $o.Uri) { continue }
+            $u = [uri]"$($o.Uri)"
+            if ($u.Scheme -ne 'https' -or -not $u.Host.EndsWith('.microsoft.com') -or $u.AbsolutePath -notmatch '/([^/]+_x64[^/]*\.iso)$') { continue }
+            return [pscustomobject]@{ url = "$($o.Uri)"; sha256 = $sha; file = $Matches[1] }
+        }
+        if (-not $r.Errors) { break }
     }
     throw "No x64 ISO link in the answer from Microsoft.$(if ($r.Errors) { ' ' + ($r.Errors | ConvertTo-Json -Compress -Depth 3) })"
 }
