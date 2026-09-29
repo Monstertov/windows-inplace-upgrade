@@ -18,7 +18,8 @@ plus the AllowUpgradesWithUnsupportedTPMOrCPU key. Unsupported by Microsoft.
 
 Optional -Window "20:00-03:00" (local time of this PC, may cross midnight): checks, cleanup and the download
 start right away, but setup and every reboot wait until the window is open. Setup that has started is never
-interrupted when the window ends.
+interrupted when the window ends. A reboot also needs 45 minutes of the window left ($RebootLead), otherwise the PC
+stays on and usable until the next window.
 #>
 param(
     [switch]$CheckOnly,     # readiness check only, changes nothing
@@ -36,6 +37,7 @@ $TaskName    = 'Win11-Upgrade'
 $MaxAttempts = 3       # setup runs, including runs after a rollback
 $IsoRetries  = 12      # install media lookup/download tries
 $IsoWaits    = 60, 120, 300, 600, 900   # seconds before try 2..6, then 1800 (Microsoft throttles fast repeats)
+$RebootLead  = 45      # with -Window: minutes of the window a reboot needs left, see Wait-Window
 
 # Microsoft software-download API, same flow as Fido (github.com/pbatard/Fido).
 $MsPage      = 'https://www.microsoft.com/en-us/software-download/windows11'
@@ -126,11 +128,24 @@ function Test-WindowOpen {
     if ($w.from -lt $w.to) { $now -ge $w.from -and $now -lt $w.to } else { $now -ge $w.from -or $now -lt $w.to }
 }
 
+# Minutes until the window closes, 0 while it is closed.
+function Get-WindowLeft {
+    if (-not (Test-WindowOpen)) { return 0 }
+    $w = ConvertTo-WindowSpan $Window
+    (($w.to - (Get-Date).TimeOfDay).TotalMinutes + 1440) % 1440
+}
+
 # Blocks until the window is open. Called before setup and before every reboot, never during setup.
-function Wait-Window([string]$before) {
-    if (Test-WindowOpen) { return }
-    Log "Waiting for the window $Window (PC time) before $before."
-    while (-not (Test-WindowOpen)) { Start-Sleep -Seconds 30 }
+# A reboot passes $minutes: it only starts with that much of the window left (the whole window when it is shorter),
+# because Windows restarts a few more times by itself after it. Otherwise it waits for the next window and the PC
+# stays on, usable, without any restart from this script.
+function Wait-Window([string]$before, [int]$minutes = 0) {
+    if (-not $Window) { return }
+    $w = ConvertTo-WindowSpan $Window
+    $need = [math]::Max(1, [math]::Min($minutes, (($w.to - $w.from).TotalMinutes + 1440) % 1440))
+    if ((Get-WindowLeft) -ge $need) { return }
+    Log "Waiting for the window $Window (PC time)$(if ($minutes) { " with at least $need minutes of it left" }) before $before. The PC can be used meanwhile."
+    while ((Get-WindowLeft) -lt $need) { Start-Sleep -Seconds 30 }
     Log "Window $Window is open, continuing."
 }
 
@@ -427,7 +442,7 @@ function Invoke-Repair {
 }
 
 function Restart-Now([string]$why) {
-    Wait-Window 'the reboot'
+    Wait-Window 'the reboot' $RebootLead
     Log "Rebooting: $why"
     Restart-Computer -Force
     exit 0
@@ -795,7 +810,8 @@ function Invoke-Worker {
         $exit = Invoke-Setup $ready $bypass ($state.attempts -gt 1)
         $code = '0x{0:X8}' -f $exit
         if ($exit -eq 0) {
-            Wait-Window 'the reboot'   # before phase is set: a reboot while waiting must not look like a rollback
+            # before phase is set: a reboot while waiting must not look like a rollback
+            Wait-Window 'the restart that finishes the upgrade (restarting the PC yourself does the same)' $RebootLead
             $state.phase = 'setup-done'; Save-State
             Restart-Now 'Setup finished, the in-place upgrade completes during this reboot.'
         }
