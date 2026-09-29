@@ -33,7 +33,8 @@ $RawUrl      = 'https://raw.githubusercontent.com/Monstertov/windows-inplace-upg
 $SetupDiag   = 'https://go.microsoft.com/fwlink/?linkid=870142'
 $TaskName    = 'Win11-Upgrade'
 $MaxAttempts = 3       # setup runs, including runs after a rollback
-$IsoRetries  = 12      # ISO lookup/download tries, 30 min apart
+$IsoRetries  = 12      # ISO lookup/download tries
+$IsoWaits    = 60, 120, 300, 600, 900   # seconds before try 2..6, then 1800 (Microsoft throttles fast repeats)
 
 # Microsoft software-download API, same flow as Fido (github.com/pbatard/Fido).
 $MsPage      = 'https://www.microsoft.com/en-us/software-download/windows11'
@@ -600,7 +601,9 @@ function Invoke-Worker {
             $state.isoFails++; Save-State
             Log "ISO not ready ($($state.isoFails)/$IsoRetries): $($_.Exception.Message)"
             if ($state.isoFails -ge $IsoRetries) { Stop-Run 'failed' "Could not get the ISO: $($_.Exception.Message)" }
-            Start-Sleep -Seconds 1800
+            $wait = if ($state.isoFails -le $IsoWaits.Count) { $IsoWaits[$state.isoFails - 1] } else { 1800 }
+            Log "Retrying the ISO in $([int]($wait / 60)) min."
+            Start-Sleep -Seconds $wait
         }
     }
     if (-not $pendingDone) { Invoke-PendingReboot $ready }
