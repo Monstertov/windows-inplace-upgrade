@@ -207,6 +207,137 @@ function Get-CompatBlocks {
     $blocks | Select-Object -Unique
 }
 
+# Boot layout of the system disk: what a cloned disk tends to leave behind. Read-only. Every check has its
+# own try, so a query that fails never hides the others and never blocks by itself. Blockers are only
+# things setup cannot get past, everything else is a warning that goes into the report and the log.
+# ponytail: free-space limits (13 MB boot partition) come from Microsoft Q&A / forum reports, not from an official spec.
+function Get-BootLayout([string]$firmware) {
+    $blk  = New-Object Collections.Generic.List[string]
+    $warn = New-Object Collections.Generic.List[string]
+    $f    = [ordered]@{}
+    $espGuid = '{c12a7328-f81f-11d2-ba4b-00a0c93ec93b}'
+    $letter  = $env:SystemDrive.TrimEnd(':')
+    $osDisk = $null; $parts = @(); $disks = @()
+
+    # Firmware mode Windows booted in (1 = BIOS, 2 = UEFI), the environment variable is only the fallback.
+    $fw = switch ((Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control' -ErrorAction SilentlyContinue).PEFirmwareType) { 1 { 'Legacy' } 2 { 'UEFI' } default { $firmware } }
+    $f.firmware = $fw
+
+    try {
+        $osPart = Get-Partition -DriveLetter $letter
+        $osDisk = Get-Disk -Number $osPart.DiskNumber
+        $disks  = @(Get-Disk -ErrorAction SilentlyContinue)
+        $parts  = @(Get-Partition -ErrorAction SilentlyContinue)
+        $f.disk = $osDisk.Number; $f.style = "$($osDisk.PartitionStyle)"; $f.bus = "$($osDisk.BusType)"
+        $f.sector = "$($osDisk.LogicalSectorSize)/$($osDisk.PhysicalSectorSize)"; $f.health = "$($osDisk.HealthStatus)"
+        if ($osDisk.IsOffline -or $osDisk.IsReadOnly) { $blk.Add('system disk is offline or read-only') }
+        if ($osDisk.HealthStatus -and "$($osDisk.HealthStatus)" -ne 'Healthy') { $warn.Add("system disk health is $($osDisk.HealthStatus)") }
+        if ($osDisk.BusType -eq 'USB') { $warn.Add('Windows runs from a USB disk') }
+        if ($fw -eq 'UEFI' -and $osDisk.PartitionStyle -ne 'GPT') { $blk.Add("booted in UEFI mode but the system disk is $($osDisk.PartitionStyle), not GPT") }
+        if ($fw -eq 'Legacy' -and $osDisk.PartitionStyle -eq 'GPT') { $blk.Add('booted in legacy BIOS mode but the system disk is GPT') }
+    } catch { $warn.Add("system disk not readable: $($_.Exception.Message)") }
+
+    # C: itself: file system and dirty bit.
+    try {
+        $vol = Get-Volume -DriveLetter $letter
+        $f.fs = "$($vol.FileSystem)"
+        if ($vol.FileSystem -ne 'NTFS') { $blk.Add("system volume is $($vol.FileSystem), setup needs NTFS") }
+        if ($vol.HealthStatus -ne 'Healthy') { $warn.Add("system volume health is $($vol.HealthStatus)") }
+        if ((Get-CimInstance Win32_Volume -Filter "DriveLetter='$env:SystemDrive'").DirtyBitSet) { $warn.Add('system volume is marked dirty, chkdsk runs at the next boot') }
+    } catch { $warn.Add("system volume not readable: $($_.Exception.Message)") }
+
+    if ($osDisk) {
+        # Where the boot files live: on the system disk, with room to update.
+        try {
+            $sys = @($parts | Where-Object IsSystem) | Select-Object -First 1
+            if (-not $sys) { $warn.Add('no partition is flagged as system partition') }
+            else {
+                $f.systemPartition = "disk $($sys.DiskNumber) part $($sys.PartitionNumber) $($sys.Type)"
+                if ($sys.DiskNumber -ne $osDisk.Number) { $warn.Add("boot files are on disk $($sys.DiskNumber), not on the system disk $($osDisk.Number) (the clone kept the old drive's boot partition)") }
+                if ($sys.DriveLetter -ne $letter) {
+                    $sv = $sys | Get-Volume -ErrorAction SilentlyContinue
+                    if ($sv -and $null -ne $sv.SizeRemaining) {
+                        $f.systemFreeMB = [math]::Round($sv.SizeRemaining / 1MB, 1)
+                        if ($sv.SizeRemaining -lt 13MB) { $blk.Add("boot partition has only $($f.systemFreeMB) MB free, setup needs about 13 MB (0xC1900104)") }
+                    }
+                }
+            }
+        } catch { $warn.Add("boot partition check failed: $($_.Exception.Message)") }
+
+        if ($fw -eq 'UEFI') {
+            try {
+                $esps = @($parts | Where-Object GptType -eq $espGuid)
+                $mine = @($esps | Where-Object DiskNumber -eq $osDisk.Number)
+                $f.espCount = $esps.Count
+                if (-not $mine) { $blk.Add('no EFI system partition on the system disk') }
+                else {
+                    $esp = $mine[0]; $f.espMB = [math]::Round($esp.Size / 1MB)
+                    if ($esp.Size -lt 200MB) { $warn.Add("EFI partition is $($f.espMB) MB, Windows 11 25H2 may not fit its boot files on a partition under 200 MB") }
+                    $ev = $esp | Get-Volume -ErrorAction SilentlyContinue
+                    if (-not $ev) { $warn.Add('EFI partition has no readable volume') }
+                    else {
+                        $f.espFs = "$($ev.FileSystem)"
+                        if ($ev.FileSystem -ne 'FAT32') { $blk.Add("EFI partition is $($ev.FileSystem), it must be FAT32") }
+                    }
+                }
+                if ($esps.Count -gt 1) { $warn.Add("$($esps.Count) EFI system partitions (disks $((($esps | ForEach-Object DiskNumber) | Sort-Object -Unique) -join ', ')), setup may pick the wrong one") }
+            } catch { $warn.Add("EFI partition check failed: $($_.Exception.Message)") }
+        } elseif ($fw -eq 'Legacy') {
+            try {
+                if (-not @($parts | Where-Object { $_.DiskNumber -eq $osDisk.Number -and $_.IsActive })) { $warn.Add('no active partition on the system disk (MBR)') }
+            } catch { $warn.Add("active partition check failed: $($_.Exception.Message)") }
+        }
+
+        # A clone that is still attached: same disk id, disk offline, or a second Windows on another disk.
+        try {
+            $dupGpt = @($disks | Where-Object { $_.PartitionStyle -eq 'GPT' -and $_.Guid } | Group-Object Guid | Where-Object Count -gt 1)
+            $dupMbr = @($disks | Where-Object { $_.PartitionStyle -eq 'MBR' -and $_.Signature } | Group-Object Signature | Where-Object Count -gt 1)
+            if ($dupGpt -or $dupMbr) { $warn.Add('two disks have the same GUID or signature (a clone is still attached)') }
+            if (@($parts | Where-Object Guid | Group-Object Guid | Where-Object Count -gt 1)) { $warn.Add('two partitions have the same GUID (a clone is still attached)') }
+            $off = @($disks | Where-Object IsOffline)
+            if ($off) { $warn.Add("disk $(($off | ForEach-Object Number) -join ', ') is offline") }
+            $other = @($parts | Where-Object { $_.DiskNumber -ne $osDisk.Number -and $_.DriveLetter -match '[A-Z]' -and (Test-Path "$($_.DriveLetter):\Windows\System32\config\SYSTEM") })
+            if ($other) { $warn.Add("another Windows installation on $(($other | ForEach-Object { "$($_.DriveLetter):" }) -join ', ') (disk $(($other | ForEach-Object DiskNumber | Sort-Object -Unique) -join ', '))") }
+        } catch { $warn.Add("clone check failed: $($_.Exception.Message)") }
+
+        # Windows Recovery Environment: the location value holds harddiskN\partitionM when it is enabled (same in every language).
+        try {
+            $re = (reagentc.exe /info 2>$null) -join ' '
+            if ($re -match 'harddisk(\d+)\\partition(\d+)') {
+                $rp = @($parts | Where-Object { $_.DiskNumber -eq [int]$Matches[1] -and $_.PartitionNumber -eq [int]$Matches[2] }) | Select-Object -First 1
+                $rv = if ($rp) { $rp | Get-Volume -ErrorAction SilentlyContinue }
+                if ($rv -and $null -ne $rv.SizeRemaining) {
+                    $f.winreFreeMB = [math]::Round($rv.SizeRemaining / 1MB)
+                    if ($rv.SizeRemaining -lt 100MB) { $warn.Add("recovery partition has only $($f.winreFreeMB) MB free") }
+                }
+                if ($rp -and $rp.DiskNumber -ne $osDisk.Number) { $warn.Add('recovery environment is on another disk than Windows') }
+            } else { $warn.Add('Windows recovery environment is disabled or missing') }
+        } catch { $warn.Add("recovery check failed: $($_.Exception.Message)") }
+    }
+
+    # Boot configuration data: no output means the store cannot be opened. Key names in bcdedit output are not translated.
+    try {
+        $bm = @(cmd.exe /c 'bcdedit /enum {bootmgr} 2>nul')
+        if (-not $bm) { $blk.Add('boot configuration data (BCD) cannot be read') }
+        else {
+            $cur = @(cmd.exe /c 'bcdedit /enum {current} 2>nul')
+            if (-not $cur) { $warn.Add('BCD has no entry for the running Windows') }
+            elseif (($cur | ForEach-Object { if ($_ -match '^\s*osdevice\s+(.+)$') { $Matches[1] } }) -notlike "*$env:SystemDrive*") { $warn.Add('BCD entry of the running Windows does not point to the system drive') }
+            $n = @(cmd.exe /c 'bcdedit /enum osloader 2>nul' | Where-Object { $_ -match '^\s*osdevice\s' }).Count
+            $f.bcdEntries = $n
+            if ($n -gt 1) { $warn.Add("BCD lists $n Windows installations (leftover boot entries)") }
+        }
+    } catch { $warn.Add("BCD check failed: $($_.Exception.Message)") }
+
+    # Windows still in setup or audit mode (a captured or half-finished image) cannot be upgraded.
+    try {
+        $s = Get-ItemProperty 'HKLM:\SYSTEM\Setup' -ErrorAction Stop
+        if ($s.SystemSetupInProgress -eq 1 -or $s.OOBEInProgress -eq 1) { $blk.Add('Windows is still in setup or audit mode (HKLM\SYSTEM\Setup SystemSetupInProgress/OOBEInProgress)') }
+    } catch { }
+
+    [ordered]@{ facts = $f; blockers = @($blk); warnings = @($warn) }
+}
+
 function Get-Readiness {
     $cv    = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion'
     $build = [int]$cv.CurrentBuild
@@ -252,11 +383,17 @@ function Get-Readiness {
     if ($build -lt 10240)                   { $bl += 'not Windows 10' }
     if ($cv.EditionID -match 'Enterprise') { $bl += "$($cv.EditionID) edition, the official ISO has only Home, Pro and Education" }
     if ($r.freeGB -lt 30 -and -not (Test-Path $iso)) { $bl += "only $($r.freeGB) GB free, need 30" }
+    if ($build -lt 22000) {
+        $lay = Get-BootLayout $r.firmware
+        $bl += $lay.blockers; $r.layout = $lay.facts; $r.layoutWarn = $lay.warnings
+    }
     $r.hwFails = $hw; $r.blockers = $bl
     $r.verdict = if ($build -ge 22000) { 'ALREADY_WIN11' } elseif ($bl) { 'BLOCKED' } elseif ($hw) { 'BYPASS' } else { 'READY' }
 
     Log "OS: $($r.edition) $($r.displayVersion) build $build.$($r.ubr), language $($r.lang)"
     Log "HW: $cpu | TPM $($r.tpm) | firmware $($r.firmware) | SecureBoot $secureBoot | RAM $ramGB GB | disk $($r.diskGB) GB, free $($r.freeGB) GB"
+    if ($r.layout) { Log ('BOOT: ' + (($r.layout.GetEnumerator() | ForEach-Object { "$($_.Key) $($_.Value)" }) -join ' | ')) }
+    foreach ($w in $r.layoutWarn) { Log "BOOT WARNING: $w" }
     Log "VERDICT: $($r.verdict) | hardware fails: $($hw -join ', ') | blockers: $($bl -join ', ')"
     $r
 }
@@ -491,13 +628,14 @@ function Invoke-Worker {
             '0xC190020E' = 'not enough disk space'
             '0x80070070' = 'not enough disk space'
             '0xC1900107' = 'cleanup of an earlier attempt is pending, needs a reboot'
+            '0xC1900104' = 'the system or EFI partition cannot be updated (too full or damaged), see the BOOT lines'
         }
         $blocks = @(Get-CompatBlocks)
         Invoke-SetupDiag
         Log "Setup failed with $code ($($known[$code]))$(if ($blocks) { '. Blocking: ' + ($blocks -join '; ') }). Windows 10 stays as it was."
         Write-SetupErrors
 
-        if ($code -in '0xC1900204', '0xC1900215') { Stop-Run 'failed' "Setup $code, $($known[$code])." }
+        if ($code -in '0xC1900204', '0xC1900215', '0xC1900104') { Stop-Run 'failed' "Setup $code, $($known[$code])." }
         if ($state.attempts -ge $MaxAttempts) { Stop-Run 'failed' "Setup failed $($state.attempts) times, last $code." }
         switch ($code) {
             { $_ -in '0xC1900200', '0xC1900202' } { $state.forceBypass = $true; Save-State }
