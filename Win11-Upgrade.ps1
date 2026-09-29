@@ -7,7 +7,8 @@ Run it elevated (Administrator or SYSTEM), no parameters needed:
   .\Win11-Upgrade.ps1
 It copies the latest version of itself from GitHub to C:\Win11Upgrade, hands the work to a SYSTEM
 scheduled task and returns. The task downloads the official ISO for the device language straight from
-Microsoft, upgrades, reboots by itself (no confirmation), continues after every reboot, retries with
+Microsoft (when Microsoft's ISO download does not work: the same setup media built from the Media Creation
+Tool catalog), upgrades, reboots by itself (no confirmation), continues after every reboot, retries with
 repairs when setup fails, and removes itself when Windows 11 is running or when it gives up.
 Everything stays on this PC: the log is C:\Win11Upgrade\upgrade.log. Nothing is sent anywhere except the
 downloads from GitHub and Microsoft.
@@ -15,7 +16,7 @@ downloads from GitHub and Microsoft.
 Devices that fail the CPU/TPM/Secure Boot check get the undocumented "setup /product server" switch
 plus the AllowUpgradesWithUnsupportedTPMOrCPU key. Unsupported by Microsoft.
 
-Optional -Window "20:00-03:00" (local time of this PC, may cross midnight): checks, cleanup and the ISO download
+Optional -Window "20:00-03:00" (local time of this PC, may cross midnight): checks, cleanup and the download
 start right away, but setup and every reboot wait until the window is open. Setup that has started is never
 interrupted when the window ends.
 #>
@@ -33,7 +34,7 @@ $RawUrl      = 'https://raw.githubusercontent.com/Monstertov/windows-inplace-upg
 $SetupDiag   = 'https://go.microsoft.com/fwlink/?linkid=870142'
 $TaskName    = 'Win11-Upgrade'
 $MaxAttempts = 3       # setup runs, including runs after a rollback
-$IsoRetries  = 12      # ISO lookup/download tries
+$IsoRetries  = 12      # install media lookup/download tries
 $IsoWaits    = 60, 120, 300, 600, 900   # seconds before try 2..6, then 1800 (Microsoft throttles fast repeats)
 
 # Microsoft software-download API, same flow as Fido (github.com/pbatard/Fido).
@@ -45,10 +46,15 @@ $MsInst      = '560dc9f3-1aa5-4a2f-b63c-9e18f8d0e175'
 $MsAgent     = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0 Safari/537.36'
 # Windows install language (culture) -> language name on Microsoft's download page. Only these are supported.
 $IsoLangs    = @{ 'nl' = 'Dutch'; 'en-us' = 'English'; 'en' = 'English International' }
+# Fallback: the Media Creation Tool catalog (see Get-EsdInfo). Same languages, as catalog language codes.
+$MctCatalog  = 'https://fe3.delivery.mp.microsoft.com/UpdateMetadataService/updates/search/v1/bydeviceinfo'
+$EsdLangs    = @{ 'nl' = 'nl-nl'; 'en-us' = 'en-us'; 'en' = 'en-gb' }
 
 $dir       = Join-Path $env:SystemDrive 'Win11Upgrade'
 $self      = Join-Path $dir 'Win11-Upgrade.ps1'
 $iso       = Join-Path $dir 'win11.iso'
+$esd       = Join-Path $dir 'win11.esd'   # catalog fallback, deleted once $media is built
+$media     = Join-Path $dir 'media'       # setup media built from the ESD
 $logFile   = Join-Path $dir 'upgrade.log'
 $stateFile = Join-Path $dir 'state.json'
 $bt        = Join-Path $env:SystemDrive '$WINDOWS.~BT\Sources'
@@ -146,6 +152,7 @@ function Invoke-Tool([string]$exe, [string]$arguments, [string]$stage) {
     Log "Running: $exe $arguments"
     $code = Wait-WithProgress (Start-Process $exe -ArgumentList $arguments -WindowStyle Hidden -PassThru) $stage
     Log "  $exe exit $code"
+    $code
 }
 
 # After a boot the network (Wi-Fi especially) can take a while. Wait up to 10 minutes.
@@ -383,7 +390,7 @@ function Get-Readiness {
     if ($cv.InstallationType -ne 'Client')  { $bl += "not a workstation ($($cv.InstallationType))" }
     if ($build -lt 10240)                   { $bl += 'not Windows 10' }
     if ($cv.EditionID -match 'Enterprise') { $bl += "$($cv.EditionID) edition, the official ISO has only Home, Pro and Education" }
-    if ($r.freeGB -lt 30 -and -not (Test-Path $iso)) { $bl += "only $($r.freeGB) GB free, need 30" }
+    if ($r.freeGB -lt 30 -and -not ((Test-Path $iso) -or (Test-Media))) { $bl += "only $($r.freeGB) GB free, need 30" }
     if ($build -lt 22000) {
         $lay = Get-BootLayout $r.firmware
         $bl += $lay.blockers; $r.layout = $lay.facts; $r.layoutWarn = $lay.warnings
@@ -409,13 +416,13 @@ function Invoke-DiskCleanup {
     Remove-Item "$env:windir\SoftwareDistribution\Download\*" -Recurse -Force -ErrorAction SilentlyContinue
     Start-Service wuauserv, bits -ErrorAction SilentlyContinue
     try { Delete-DeliveryOptimizationCache -Force -ErrorAction Stop } catch { }
-    Invoke-Tool dism.exe '/Online /Cleanup-Image /StartComponentCleanup /Quiet' 'cleanup: component store'
+    $null = Invoke-Tool dism.exe '/Online /Cleanup-Image /StartComponentCleanup /Quiet' 'cleanup: component store'
 }
 
 function Invoke-Repair {
     Log 'Autoheal: DISM /RestoreHealth and sfc /scannow.'
-    Invoke-Tool dism.exe '/Online /Cleanup-Image /RestoreHealth /Quiet' 'repair: DISM RestoreHealth'
-    Invoke-Tool sfc.exe '/scannow' 'repair: sfc'
+    $null = Invoke-Tool dism.exe '/Online /Cleanup-Image /RestoreHealth /Quiet' 'repair: DISM RestoreHealth'
+    $null = Invoke-Tool sfc.exe '/scannow' 'repair: sfc'
 }
 
 function Restart-Now([string]$why) {
@@ -425,7 +432,7 @@ function Restart-Now([string]$why) {
     exit 0
 }
 
-# Done or given up: remove the task, the ISO and the post-upgrade hook. The log stays.
+# Done or given up: remove the task, the install media and the post-upgrade hook. The log stays.
 function Stop-Run([string]$result, [string]$why) {
     $state.phase = $result; Save-State
     Log "$($result.ToUpper()): $why"
@@ -433,7 +440,7 @@ function Stop-Run([string]$result, [string]$why) {
         Write-SetupErrors
         Log "Where to look: $logFile, the setup logs in $dir\logs and $bt\Panther (setuperr.log, setupact.log). Fix the cause, then run the command again to start over."
     }
-    Remove-Item $iso, "$iso.sha256", "$dir\postoobe" -Recurse -Force -ErrorAction SilentlyContinue
+    Remove-Item $iso, "$iso.sha256", $esd, "$esd.sha256", $media, "$dir\postoobe" -Recurse -Force -ErrorAction SilentlyContinue
     Complete-Task   # last: removing the task may end this run
     exit $(if ($result -eq 'done') { 0 } else { 1 })
 }
@@ -485,57 +492,162 @@ function Resolve-Iso([string]$name) {
     throw "No x64 ISO link in the answer from Microsoft.$(if ($r.Errors) { ' ' + ($r.Errors | ConvertTo-Json -Compress -Depth 3) })"
 }
 
-function Get-Iso([string]$lang) {
-    # Official Microsoft ISO for the install language of this PC, with Microsoft's published SHA256.
+# Fallback when the ISO download does not work: the catalog the Media Creation Tool itself uses, from Microsoft's
+# update metadata service. It lists the current release as one install.esd per language and edition, with its SHA256.
+# The service answers over https; the cab and the ESD come over plain http (Microsoft's CDN has no certificate for those
+# hosts, like Windows Update) and are checked against the SHA256 values from that https answer.
+function Get-EsdInfo([string]$lang, [string]$edition) {
+    $code = $EsdLangs[$lang.ToLower()]
+    if (-not $code) { $code = $EsdLangs[$lang.ToLower().Split('-')[0]] }
+    if (-not $code) { throw "No catalog language for $lang." }
+    $body = '{"Products":"PN=Windows.Products.Cab.amd64&V=26100.0.0.0","DeviceAttributes":"DUScan=1;OSVersion=10.0.026100.1"}'
+    $r = Invoke-RestMethod $MctCatalog -Method Post -ContentType 'application/json' -Body $body -TimeoutSec 60 -UseBasicParsing
+    $loc = @(@($r)[0].FileLocations | Where-Object { $_.FileName -eq 'products.cab' })[0]
+    if (-not $loc.Url -or -not $loc.Digest) { throw 'The catalog service returned no products.cab.' }
+    if (-not ([uri]"$($loc.Url)").Host.EndsWith('.microsoft.com')) { throw 'The catalog service returned a products.cab outside microsoft.com.' }
+
+    $cab = Join-Path $dir 'products.cab'; $out = Join-Path $dir 'products'
+    try {
+        Remove-Item $out -Recurse -Force -ErrorAction SilentlyContinue
+        $null = New-Item $out -ItemType Directory -Force
+        Invoke-WebRequest "$($loc.Url)" -OutFile $cab -TimeoutSec 120 -UseBasicParsing
+        $sha = [Convert]::ToBase64String([Security.Cryptography.SHA256]::Create().ComputeHash([IO.File]::ReadAllBytes($cab)))
+        if ($sha -ne $loc.Digest) { throw 'products.cab does not match the SHA256 from the catalog service.' }
+        # expand.exe first, extrac32.exe as second try. Both are part of Windows. cmd merges stderr so PowerShell does not throw on it.
+        $said = cmd.exe /c "expand.exe `"$cab`" -F:* `"$out`" 2>&1" | Out-String
+        if (-not (Test-Path "$out\products.xml")) { $said += cmd.exe /c "extrac32.exe /Y /E /L `"$out`" `"$cab`" 2>&1" | Out-String }
+        if (-not (Test-Path "$out\products.xml")) { throw "No products.xml from the cab ($((Get-Item $cab).Length) bytes): $($said.Trim() -replace '\s+', ' ')" }
+        $xml = New-Object Xml.XmlDocument
+        $xml.Load("$out\products.xml")
+    } finally {
+        Remove-Item $cab, $out -Recurse -Force -ErrorAction SilentlyContinue
+    }
+
+    $f = @($xml.SelectNodes('//File') | Where-Object { $_.LanguageCode -eq $code -and $_.Architecture -eq 'x64' -and $_.Edition -eq $edition })[0]
+    if (-not $f) { throw "The catalog has no $edition x64 image in $code." }
+    $u = [uri]"$($f.FilePath)"
+    if ($u.Scheme -notin 'http', 'https' -or -not $u.Host.EndsWith('.microsoft.com')) { throw "The catalog image for $code is not on microsoft.com." }
+    if ("$($f.Sha256)" -notmatch '^[0-9a-fA-F]{64}$') { throw "The catalog image for $code has no SHA256." }
+    Log ('CATALOG: {0}, {1:N2} GB' -f $f.FileName, ([int64]$f.Size / 1GB))
+    [pscustomobject]@{ url = "$($f.FilePath)"; sha256 = "$($f.Sha256)".ToUpper(); file = "$($f.FileName)"; language = $code; kind = 'esd' }
+}
+
+# Setup media built from the catalog ESD and ready to use: $media\ready.txt is written last.
+function Test-Media { (Test-Path "$media\setup.exe") -and (Test-Path "$media\ready.txt") }
+
+# Turns the ESD into the same layout the Media Creation Tool writes to a USB stick: the setup files (image
+# "Windows Setup Media"), sources\boot.wim (Windows PE + Windows Setup) and sources\install.wim with only the
+# edition of this PC. dism.exe is part of Windows. The ESD is deleted afterwards.
+function Build-Media([string]$file, [string]$edition) {
+    Remove-Item $media -Recurse -Force -ErrorAction SilentlyContinue
+    $images = @(Get-WindowsImage -ImagePath $esd)
+    $images | ForEach-Object { Log "ESD image $($_.ImageIndex): $($_.ImageName)" }
+    $setupFiles = @($images | Where-Object { $_.ImageName -eq 'Windows Setup Media' })[0]
+    $pe = @($images | Where-Object { $_.ImageName -like 'Microsoft Windows PE*' })[0]
+    $winSetup = @($images | Where-Object { $_.ImageName -like 'Microsoft Windows Setup*' })[0]
+    if (-not $setupFiles -or -not $pe -or -not $winSetup) { throw 'The ESD does not have the setup media images.' }
+    $os = $null
+    foreach ($i in $images) {
+        if ($i.ImageIndex -in $setupFiles.ImageIndex, $pe.ImageIndex, $winSetup.ImageIndex) { continue }
+        if ((Get-WindowsImage -ImagePath $esd -Index $i.ImageIndex).EditionId -eq $edition) { $os = $i; break }
+    }
+    if (-not $os) { throw "The ESD has no $edition image." }
+
+    $null = New-Item -ItemType Directory -Force $media
+    $steps = @(
+        @("/Apply-Image /ImageFile:`"$esd`" /Index:$($setupFiles.ImageIndex) /ApplyDir:`"$media`"", 'media: setup files'),
+        @("/Export-Image /SourceImageFile:`"$esd`" /SourceIndex:$($pe.ImageIndex) /DestinationImageFile:`"$media\sources\boot.wim`" /Compress:max", 'media: boot.wim WinPE'),
+        @("/Export-Image /SourceImageFile:`"$esd`" /SourceIndex:$($winSetup.ImageIndex) /DestinationImageFile:`"$media\sources\boot.wim`" /Compress:max /Bootable", 'media: boot.wim setup'),
+        @("/Export-Image /SourceImageFile:`"$esd`" /SourceIndex:$($os.ImageIndex) /DestinationImageFile:`"$media\sources\install.wim`" /Compress:max", "media: install.wim $edition")
+    )
+    foreach ($s in $steps) {
+        $exit = Invoke-Tool dism.exe $s[0] $s[1]
+        if ($exit -ne 0) { throw "dism.exe exit $exit at '$($s[1])', see $env:windir\Logs\DISM\dism.log." }
+    }
+    if (-not (Test-Path "$media\setup.exe") -or -not (Test-Path "$media\sources\install.wim")) { throw 'dism.exe finished but setup.exe or install.wim is missing.' }
+    Set-Content "$media\ready.txt" $file
+    Remove-Item $esd, "$esd.sha256" -Force -ErrorAction SilentlyContinue
+    Log ('Install media ready in {0} ({1:N2} GB), ESD deleted.' -f $media, ((Get-ChildItem $media -Recurse -File | Measure-Object Length -Sum).Sum / 1GB))
+}
+
+function Get-Iso([string]$lang, [string]$edition) {
+    # Official Microsoft install media for the language and edition of this PC, checked against Microsoft's SHA256.
     $name = $IsoLangs[$lang.ToLower()]
     if (-not $name) { $name = $IsoLangs[$lang.ToLower().Split('-')[0]] }
     if (-not $name) { throw "No Windows 11 ISO for language $lang." }   # fatal, see Invoke-Worker
+    if (Test-Media) { Log "Install media from the catalog already built ($(Get-Content "$media\ready.txt"))."; return }
 
     # A finished, verified ISO from an earlier run needs no new lookup (Microsoft limits repeated lookups).
     $saved = "$(Get-Content "$iso.sha256" -ErrorAction SilentlyContinue)"
     if ($saved -match '^[0-9A-F]{64}$' -and (Test-Path $iso) -and (Get-FileHash $iso -Algorithm SHA256).Hash -eq $saved) { Log 'ISO already present, hash OK.'; return }
 
-    $info = Resolve-Iso $name
-    Log "ISO: $($info.file) ($name)"
+    # The ISO from Microsoft's download page first, the Media Creation Tool catalog (an ESD) when that does not work.
+    $info = $null; $isoErr = $null
+    if ($script:skipIso) { Log 'The ISO did not match its published SHA256, using the Media Creation Tool catalog this time.' }
+    else {
+        try { $info = Resolve-Iso $name }
+        catch { $isoErr = $_.Exception.Message; Log "ISO lookup failed ($isoErr), trying the Media Creation Tool catalog." }
+    }
+    if (-not $info) {
+        try { $info = Get-EsdInfo $lang $edition }
+        catch { throw "$(if ($isoErr) { "ISO: $isoErr | " })Catalog: $($_.Exception.Message)" }
+    }
+    $esdRoute = $info.kind -eq 'esd'
+    $file = if ($esdRoute) { $esd } else { $iso }
+    Log "$(if ($esdRoute) { "ESD: $($info.file) ($($info.language))" } else { "ISO: $($info.file) ($name)" })"
     $u = [uri]$info.url
-    Log "ISO source: $($u.Scheme)://$($u.Host)$($u.AbsolutePath)"   # no query string or credentials in the log
+    Log "Source: $($u.Scheme)://$($u.Host)$($u.AbsolutePath)"   # no query string or credentials in the log
     $want = "$($info.sha256)".ToUpper()
-    if ($want -notmatch '^[0-9A-F]{64}$') { throw 'No valid SHA256 for the ISO.' }
-    # A partial download of another ISO cannot be resumed.
-    if ($saved -ne $want) { Remove-Item $iso -Force -ErrorAction SilentlyContinue }
-    Set-Content "$iso.sha256" $want
+    if ($want -notmatch '^[0-9A-F]{64}$') { throw 'No valid SHA256 for the download.' }
+    # A partial download of another file cannot be resumed.
+    if ("$(Get-Content "$file.sha256" -ErrorAction SilentlyContinue)" -ne $want) { Remove-Item $file -Force -ErrorAction SilentlyContinue }
+    Set-Content "$file.sha256" $want
+    if ((Test-Path $file) -and (Get-FileHash $file -Algorithm SHA256).Hash -eq $want) {
+        Log 'Download already present, hash OK.'
+        if ($esdRoute) { Build-Media $info.file $edition }
+        return
+    }
 
     $t = Get-Date
     $total = 0
     try { $total = [int64](Invoke-WebRequest $info.url -Method Head -TimeoutSec 30 -UseBasicParsing).Headers['Content-Length'] } catch { }
-    $start = if (Test-Path $iso) { (Get-Item $iso).Length } else { 0 }
+    $start = if (Test-Path $file) { (Get-Item $file).Length } else { 0 }
     Log ('Downloading {0:N2} GB{1}.' -f ($total / 1GB), $(if ($start) { ', resuming at {0:N2} GB' -f ($start / 1GB) }))
     $curlErr = Join-Path $dir 'curl-error.txt'
-    # curl.exe ships with Windows 10 1803+, resumes partial downloads, verifies the certificate.
-    $curlArgs = "--location --fail --silent --show-error --retry 5 --retry-delay 30 --connect-timeout 30 --continue-at - --output `"$iso`" --stderr `"$curlErr`" `"$($info.url)`""
+    # curl.exe ships with Windows 10 1803+, resumes partial downloads, verifies the certificate on https.
+    $curlArgs = "--location --fail --silent --show-error --retry 5 --retry-delay 30 --connect-timeout 30 --continue-at - --output `"$file`" --stderr `"$curlErr`" `"$($info.url)`""
     $curlCode = Wait-WithProgress (Start-Process curl.exe -ArgumentList $curlArgs -WindowStyle Hidden -PassThru) 'download' {
-        $have = if (Test-Path $iso) { (Get-Item $iso).Length } else { 0 }
+        $have = if (Test-Path $file) { (Get-Item $file).Length } else { 0 }
         ', {0:N2} GB{1}' -f ($have / 1GB), $(if ($total) { ' ({0:N1}%)' -f (100 * $have / $total) })
     }
     if (Test-Path $curlErr) { Get-Content $curlErr | ForEach-Object { Log "curl: $_" } }
-    if ($curlCode -eq 33 -or $curlCode -eq 36) { Remove-Item $iso -Force -ErrorAction SilentlyContinue }   # resume refused, start over next try
+    if ($curlCode -eq 33 -or $curlCode -eq 36) { Remove-Item $file -Force -ErrorAction SilentlyContinue }   # resume refused, start over next try
     if ($curlCode -ne 0) { throw "Download failed, curl exit code $curlCode." }
-    Log ('Downloaded {0:N2} GB in {1:N0} min.' -f ((Get-Item $iso).Length / 1GB), ((Get-Date) - $t).TotalMinutes)
-    if ((Get-FileHash $iso -Algorithm SHA256).Hash -ne $want) { Remove-Item $iso -Force; throw 'SHA256 mismatch, ISO deleted.' }
+    Log ('Downloaded {0:N2} GB in {1:N0} min.' -f ((Get-Item $file).Length / 1GB), ((Get-Date) - $t).TotalMinutes)
+    if ((Get-FileHash $file -Algorithm SHA256).Hash -ne $want) {
+        Remove-Item $file -Force
+        if (-not $esdRoute) { $script:skipIso = $true }   # Microsoft's page and download can disagree right after a release
+        throw 'SHA256 mismatch, download deleted.'
+    }
     Log 'Hash OK.'
+    if ($esdRoute) { Build-Media $info.file $edition }
 }
 
 function Invoke-Setup($ready, [bool]$bypass, [bool]$dynamicUpdate) {
-    Dismount-DiskImage -ImagePath $iso -ErrorAction SilentlyContinue | Out-Null   # stale mount from a killed run
-    $drive = (Mount-DiskImage -ImagePath $iso -PassThru | Get-Volume).DriveLetter
-    Log "ISO mounted on ${drive}:"
+    $fromEsd = Test-Media
+    if ($fromEsd) { $root = $media; Log "Using the install media built from the catalog in $media." }
+    else {
+        Dismount-DiskImage -ImagePath $iso -ErrorAction SilentlyContinue | Out-Null   # stale mount from a killed run
+        $root = "$((Mount-DiskImage -ImagePath $iso -PassThru | Get-Volume).DriveLetter):"
+        Log "ISO mounted on $root"
+    }
     try {
-        # Stop before setup if the ISO cannot keep apps on this device (wrong language or edition).
-        $wim = Get-ChildItem "${drive}:\sources\install.*" | Where-Object Extension -in '.wim', '.esd' | Select-Object -First 1
+        # Stop before setup if the media cannot keep apps on this device (wrong language or edition).
+        $wim = Get-ChildItem "$root\sources\install.*" | Where-Object Extension -in '.wim', '.esd' | Select-Object -First 1
         $images = Get-WindowsImage -ImagePath $wim.FullName | ForEach-Object { Get-WindowsImage -ImagePath $wim.FullName -Index $_.ImageIndex }
-        $images | ForEach-Object { Log "ISO image $($_.ImageIndex): $($_.EditionId) $($_.Version) $($_.Languages -join ',')" }
+        $images | ForEach-Object { Log "Media image $($_.ImageIndex): $($_.EditionId) $($_.Version) $($_.Languages -join ',')" }
         if (-not ($images | Where-Object { $_.EditionId -eq $ready.edition -and $_.Languages -like "$($ready.lang)*" })) {
-            Log "ISO has no $($ready.edition) image in $($ready.lang), an in-place upgrade would not keep apps."
+            Log "The install media has no $($ready.edition) image in $($ready.lang), an in-place upgrade would not keep apps."
             return 0xC1900204   # same code setup gives for this, handled as fatal below
         }
         if ($bypass) {
@@ -552,14 +664,14 @@ function Invoke-Setup($ready, [bool]$bypass, [bool]$dynamicUpdate) {
         if ($bypass) { $setupArgs = "/product server $setupArgs" }
         Log "Running: setup.exe $setupArgs"
         $t = Get-Date
-        $exit = Wait-WithProgress (Start-Process "${drive}:\setup.exe" -ArgumentList $setupArgs -PassThru) 'setup' {
+        $exit = Wait-WithProgress (Start-Process "$root\setup.exe" -ArgumentList $setupArgs -PassThru) 'setup' {
             $vol = Get-ItemProperty 'HKLM:\SYSTEM\Setup\MoSetup\Volatile' -ErrorAction SilentlyContinue
             if ($vol.SetupProgress) { ", $($vol.SetupProgress)%" }
         }
         Log ('Setup ran {0:N0} min, exit 0x{1:X8}.' -f ((Get-Date) - $t).TotalMinutes, $exit)
         $exit
     } finally {
-        Dismount-DiskImage -ImagePath $iso -ErrorAction SilentlyContinue | Out-Null
+        if (-not $fromEsd) { Dismount-DiskImage -ImagePath $iso -ErrorAction SilentlyContinue | Out-Null }
     }
 }
 
@@ -589,25 +701,25 @@ function Invoke-Worker {
         Invoke-Repair
     }
 
-    if ($ready.freeGB -lt 30 -and -not (Test-Path $iso)) {
+    if ($ready.freeGB -lt 30 -and -not ((Test-Path $iso) -or (Test-Media))) {
         Invoke-DiskCleanup
         $ready = Get-Readiness
     }
     if ($ready.verdict -eq 'BLOCKED') { Stop-Run 'failed' "Blocked: $($ready.blockers -join ', ')" }
 
-    # With a closed window the reboot waits until after the ISO download, so the download starts right away.
+    # With a closed window the reboot waits until after the download, so the download starts right away.
     $pendingDone = Test-WindowOpen
     if ($pendingDone) { Invoke-PendingReboot $ready }
 
     while ($true) {
-        try { Get-Iso $ready.lang; break }
+        try { Get-Iso $ready.lang $ready.edition; break }
         catch {
             if ($_.Exception.Message -like 'No Windows 11 ISO for language*') { Stop-Run 'failed' $_.Exception.Message }
             $state.isoFails++; Save-State
-            Log "ISO not ready ($($state.isoFails)/$IsoRetries): $($_.Exception.Message)"
-            if ($state.isoFails -ge $IsoRetries) { Stop-Run 'failed' "Could not get the ISO: $($_.Exception.Message)" }
+            Log "Install media not ready ($($state.isoFails)/$IsoRetries): $($_.Exception.Message)"
+            if ($state.isoFails -ge $IsoRetries) { Stop-Run 'failed' "Could not get install media: $($_.Exception.Message)" }
             $wait = if ($state.isoFails -le $IsoWaits.Count) { $IsoWaits[$state.isoFails - 1] } else { 1800 }
-            Log "Retrying the ISO in $([int]($wait / 60)) min."
+            Log "Retrying in $([int]($wait / 60)) min."
             Start-Sleep -Seconds $wait
         }
     }
@@ -617,7 +729,7 @@ function Invoke-Worker {
         Wait-Window 'starting setup'
         $state.attempts++; Save-State
         $bypass = $ready.verdict -eq 'BYPASS' -or $state.forceBypass
-        Log "Setup attempt $($state.attempts) of $MaxAttempts$(if ($bypass) { ', with the unsupported hardware bypass' })."
+        Log "Setup attempt $($state.attempts) of $MaxAttempts$(if ($bypass) { ', with the unsupported hardware bypass' })$(if (Test-Media) { ', from the catalog media' })."
         $exit = Invoke-Setup $ready $bypass ($state.attempts -gt 1)
         $code = '0x{0:X8}' -f $exit
         if ($exit -eq 0) {
@@ -628,8 +740,8 @@ function Invoke-Worker {
 
         # Codes from Microsoft Learn: Windows Setup command-line options and upgrade error codes.
         $known = @{
-            '0xC1900204' = 'keep apps not possible, ISO language or edition does not match'
-            '0xC1900215' = 'no matching image in the ISO'
+            '0xC1900204' = 'keep apps not possible, the install media language or edition does not match'
+            '0xC1900215' = 'no matching image in the install media'
             '0xC1900208' = 'an app or driver blocks the upgrade'
             '0xC1900200' = 'hardware not eligible, the bypass did not apply'
             '0xC1900202' = 'hardware not eligible, the bypass did not apply'
