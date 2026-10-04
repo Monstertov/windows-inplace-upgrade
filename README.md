@@ -1,8 +1,10 @@
 # windows-inplace-upgrade
 
-<a href="https://learn.microsoft.com/powershell/" target="_blank"><img src="https://custom-icon-badges.demolab.com/badge/PowerShell-012456?logo=powershell&logoColor=white" alt="PowerShell" /></a>
-<img src="https://img.shields.io/badge/Windows-10%20to%2011-0078D4?logo=windows11&logoColor=white" alt="Windows 10 to 11" />
-<img src="https://img.shields.io/badge/upgrade-in--place-2ea44f" alt="In-place upgrade" />
+<p align="center">
+  <a href="https://learn.microsoft.com/powershell/" target="_blank"><img src="https://custom-icon-badges.demolab.com/badge/PowerShell-012456?logo=powershell&logoColor=white" alt="PowerShell" /></a>
+  <img src="https://img.shields.io/badge/Windows-10%20to%2011-0078D4?logo=windows11&logoColor=white" alt="Windows 10 to 11" />
+  <img src="https://img.shields.io/badge/upgrade-in--place-2ea44f" alt="In-place upgrade" />
+</p>
 
 **[Quick start](#quick-start)** · **[Usage](#usage)** · **[Options](#optional-parameters)** · **[Window](#-window-optional)** · **[Requirements](#requirements)** · **[What it does](#what-it-does)** · **[Progress](#follow-the-progress)** · **[If something fails](#if-something-fails)** · **[Bug report](#bug-report)** · **[After](#after-the-upgrade)**
 
