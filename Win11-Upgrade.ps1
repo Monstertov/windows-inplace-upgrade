@@ -19,7 +19,6 @@ plus the AllowUpgradesWithUnsupportedTPMOrCPU key. Unsupported by Microsoft.
 Optional -After "20:00" (local time of this PC): checks, cleanup and the download start right away, but setup and
 every reboot wait until the next time the clock reads 20:00 (today, or tomorrow when 20:00 has passed today).
 From then on it runs to the end without a time limit: setup and its reboots can go on until it is done.
-The -Window "20:00-03:00" of older versions still works: its start time is used, its end time is ignored.
 #>
 param(
     [switch]$CheckOnly,     # readiness check only, changes nothing

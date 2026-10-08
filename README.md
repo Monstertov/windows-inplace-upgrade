@@ -108,8 +108,6 @@ minutes and the whole run 1 to 2 hours, but a slow disk, an old CPU or a pending
 longer. So once that time has come, setup and every reboot it needs run until the upgrade is done, also when that
 is the next morning. Pick a time early enough that it is done before people start working.
 
-`-Window` from older versions still works: its start time is used as `-After`, its end time is ignored.
-
 **Run in PowerShell, as Administrator:**
 
 ```powershell
