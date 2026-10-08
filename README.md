@@ -5,7 +5,7 @@
   <a href="https://www.microsoft.com/windows/windows-11" target="_blank"><img src="https://custom-icon-badges.demolab.com/badge/Windows-10%20to%2011-0078D6?logo=windows11&logoColor=white" alt="Windows 10 to 11" /></a>
 </p>
 
-**[Quick start](#quick-start)** · **[Usage](#usage)** · **[Options](#optional-parameters)** · **[Window](#-window-optional)** · **[Requirements](#requirements)** · **[What it does](#what-it-does)** · **[Progress](#follow-the-progress)** · **[If something fails](#if-something-fails)** · **[Bug report](#bug-report)** · **[After](#after-the-upgrade)**
+**[Quick start](#quick-start)** · **[Usage](#usage)** · **[Options](#optional-parameters)** · **[After](#-after-optional)** · **[Requirements](#requirements)** · **[What it does](#what-it-does)** · **[Progress](#follow-the-progress)** · **[If something fails](#if-something-fails)** · **[Bug report](#bug-report)** · **[After](#after-the-upgrade)**
 
 One command upgrades a Windows 10 PC to Windows 11 **in place**, unattended. Start it in the evening from an
 elevated PowerShell or your RMM and check the PC the next morning. Apps, files and settings stay.
@@ -16,7 +16,7 @@ If it cannot finish, `C:\Win11Upgrade\REPORT.txt` on the PC says why.
 
 > [!CAUTION]
 > **The PC reboots by itself, without asking.** Save your work first and run it outside working hours, or use
-> `-Window` ([see below](#-window-optional)) to choose when setup and reboots may happen.
+> `-After` ([see below](#-after-optional)) to choose from when setup and reboots may happen.
 
 > [!CAUTION]
 > **Run it once per PC. Never put it in a recurring job or scheduled task** (RMM or otherwise): every run
@@ -37,18 +37,18 @@ unsupported hardware bypass), `BLOCKED` (cannot work, the blockers follow on tha
 & ([scriptblock]::Create((irm https://raw.githubusercontent.com/Monstertov/windows-inplace-upgrade/main/install.ps1))) -CheckOnly
 ```
 
-**2. Start the upgrade for tonight.** The download starts right away, setup and the reboots wait for the window
-(here 20:00 to 06:00, the PC's own clock). Wait for the green line, then close the window.
+**2. Start the upgrade for tonight.** The download starts right away, setup and the reboots wait until 20:00
+(the PC's own clock). Wait for the green line, then close the window.
 
 ```powershell
-& ([scriptblock]::Create((irm https://raw.githubusercontent.com/Monstertov/windows-inplace-upgrade/main/install.ps1))) -Window 20:00-06:00
+& ([scriptblock]::Create((irm https://raw.githubusercontent.com/Monstertov/windows-inplace-upgrade/main/install.ps1))) -After 20:00
 ```
 
 Leave the PC switched on, and not asleep, overnight. Nobody needs to sign in.
 
 **3. Next morning, check the result.** `winver` shows Windows 11, and `C:\Win11Upgrade\upgrade.log` has a line
 starting with `DONE:` near the bottom. Still Windows 10? Open `C:\Win11Upgrade\REPORT.txt`: it says why and what
-to do. No `REPORT.txt` means it did not give up: it is still busy or waiting for the next window, the log says which.
+to do. No `REPORT.txt` means it did not give up: it is still busy or waiting for the `-After` time, the log says which.
 
 That is all. The sections below explain every option, what happens on the PC and what to do when something fails.
 
@@ -73,7 +73,7 @@ It takes about 45 to 90 minutes, depending on the PC and the internet speed. The
 
 ### Optional parameters
 
-All options are optional. `-Window` has its [own section](#-window-optional).
+All options are optional. `-After` has its [own section](#-after-optional).
 
 Parameters go behind the command, in this form:
 
@@ -87,49 +87,37 @@ Parameters go behind the command, in this form:
 |---|---|
 | `-CheckOnly` | Only checks if the PC can upgrade and changes nothing. |
 
-### `-Window` (optional)
+### `-After` (optional)
 
-`-Window` is optional. Without it the upgrade starts right away and reboots whenever it needs to. Add it when
-the PC is in use during the day and setup and the reboots should wait for a quiet period.
+`-After` is optional. Without it the upgrade starts right away and reboots whenever it needs to. Add it when
+the PC is in use during the day and setup and the reboots should wait until people have gone home.
 
-Format: `HH:mm-HH:mm`, 24-hour clock, start then end. The window may cross midnight.
+Format: `HH:mm`, 24-hour clock. It means **the next time the clock reads that time**: today, or tomorrow when that
+time has already passed today. Started at 14:00 with `-After 20:00`, setup waits until 20:00 today. Started at 21:00
+with `-After 20:00`, it waits until 20:00 tomorrow. To start right away, leave `-After` out.
 
 **The time is the local system time of the PC** the script runs on (its own clock and time zone, not your
-time zone and not the server's). A PC set to a different time zone than you expect opens its window at that PC's
-local time.
+time zone and not the server's).
 
-What waits for the window: starting setup and every reboot. What does not: the checks, cleanup and the
-download start right away, so setup can begin the moment the window opens. The window is remembered across
-reboots. An invalid value is refused before anything is changed.
+What waits: starting setup and every reboot. What does not: the checks, cleanup and the download start right away,
+so setup can begin the moment that time comes. The time is remembered across reboots. An invalid value is refused
+before anything is changed.
 
-**Reboots never start outside the window, and not in its last 45 minutes.** After the script restarts the PC,
-Windows restarts it a few more times by itself to finish the upgrade (about 10 minutes on fast PCs, longer on slow
-ones). The 45 minutes are for that, so it is done before the window closes. In a window shorter than 45 minutes,
-reboots only start at the beginning of the window.
+**There is no end time.** Nobody can say how long an upgrade takes on a given PC: on fast PCs setup took 35 to 70
+minutes and the whole run 1 to 2 hours, but a slow disk, an old CPU or a pending update round makes it take much
+longer. So once that time has come, setup and every reboot it needs run until the upgrade is done, also when that
+is the next morning. Pick a time early enough that it is done before people start working.
 
-**When setup finishes too late**, for example at 02:30 in a `20:00-03:00` window, the PC is not restarted. It stays
-on with Windows 10, can be used normally, and the script restarts it at the start of the next window to finish the
-upgrade. Restarting the PC yourself in the meantime finishes it too; that restart then takes as long as the
-upgrade's own restarts (10 minutes or more).
-
-The window decides when setup may **start**. It is not a deadline: nobody can say how long an upgrade takes on a
-given PC. On two fast PCs setup took 35 to 45 minutes and the whole run about an hour, but a slow disk, an old CPU or
-a pending update round makes it take much longer. Setup that starts inside the window keeps running past its end,
-so the PC can be busy (not restarting) after the window closes. On a very slow PC, Windows' own restarts can also
-take longer than 45 minutes. So choose a window that opens early enough, and do not use a short window to guarantee
-the PC is free by a certain time.
+`-Window` from older versions still works: its start time is used as `-After`, its end time is ignored.
 
 **Run in PowerShell, as Administrator:**
 
 ```powershell
-# overnight, crosses midnight: 20:00 until 03:00 the next morning
-& ([scriptblock]::Create((irm https://raw.githubusercontent.com/Monstertov/windows-inplace-upgrade/main/install.ps1))) -Window 20:00-03:00
+# tonight from 20:00
+& ([scriptblock]::Create((irm https://raw.githubusercontent.com/Monstertov/windows-inplace-upgrade/main/install.ps1))) -After 20:00
 
-# same day: 01:00 until 05:00
-& ([scriptblock]::Create((irm https://raw.githubusercontent.com/Monstertov/windows-inplace-upgrade/main/install.ps1))) -Window 01:00-05:00
-
-# lunch break
-& ([scriptblock]::Create((irm https://raw.githubusercontent.com/Monstertov/windows-inplace-upgrade/main/install.ps1))) -Window 12:00-13:00
+# tonight from 01:00 (started during the day: 01:00 has passed today, so this is the coming night)
+& ([scriptblock]::Create((irm https://raw.githubusercontent.com/Monstertov/windows-inplace-upgrade/main/install.ps1))) -After 01:00
 ```
 
 <sub>[back to top](#windows-inplace-upgrade)</sub>
@@ -236,7 +224,7 @@ and attach `C:\Win11Upgrade\bugreport.zip` from that PC. The script makes it whe
 
 These files contain the PC name and hardware details. Look through them before you share them.
 If the zip is missing, attach `REPORT.txt` and `upgrade.log` instead. In the issue, also say how you ran the command
-(PowerShell as Administrator, RMM as SYSTEM, with or without `-Window`).
+(PowerShell as Administrator, RMM as SYSTEM, with or without `-After`).
 
 Sometimes more is needed: `setupact.log` in `C:\$WINDOWS.~BT\Sources\Panther` (large, zip it first) or
 `C:\Windows\Logs\DISM\dism.log` for a DISM error. The issue will say so.

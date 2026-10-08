@@ -16,14 +16,15 @@ downloads from GitHub and Microsoft.
 Devices that fail the CPU/TPM/Secure Boot check get the undocumented "setup /product server" switch
 plus the AllowUpgradesWithUnsupportedTPMOrCPU key. Unsupported by Microsoft.
 
-Optional -Window "20:00-03:00" (local time of this PC, may cross midnight): checks, cleanup and the download
-start right away, but setup and every reboot wait until the window is open. Setup that has started is never
-interrupted when the window ends. A reboot also needs 45 minutes of the window left ($RebootLead), otherwise the PC
-stays on and usable until the next window.
+Optional -After "20:00" (local time of this PC): checks, cleanup and the download start right away, but setup and
+every reboot wait until the next time the clock reads 20:00 (today, or tomorrow when 20:00 has passed today).
+From then on it runs to the end without a time limit: setup and its reboots can go on until it is done.
+The -Window "20:00-03:00" of older versions still works: its start time is used, its end time is ignored.
 #>
 param(
     [switch]$CheckOnly,     # readiness check only, changes nothing
-    [string]$Window,        # "HH:mm-HH:mm" in local PC time: setup and reboots only inside this window
+    [string]$After,         # "HH:mm" in local PC time: setup and reboots only from then on
+    [string]$Window,        # older versions: "HH:mm-HH:mm", now only its start time is used, like -After
     [switch]$Worker,        # internal: the scheduled task runs this
     [switch]$NoUpdate       # internal: skip the self-update
 )
@@ -37,7 +38,6 @@ $TaskName    = 'Win11-Upgrade'
 $MaxAttempts = 3       # setup runs, including runs after a rollback
 $IsoRetries  = 12      # install media lookup/download tries
 $IsoWaits    = 60, 120, 300, 600, 900   # seconds before try 2..6, then 1800 (Microsoft throttles fast repeats)
-$RebootLead  = 45      # with -Window: minutes of the window a reboot needs left, see Wait-Window
 
 # Microsoft software-download API, same flow as Fido (github.com/pbatard/Fido).
 $MsPage      = 'https://www.microsoft.com/en-us/software-download/windows11'
@@ -72,17 +72,20 @@ if ($productType -ne 'WinNT') {
     exit 1
 }
 
-# "20:00-03:00" -> start and end as time of day. Checked before anything is written.
-function ConvertTo-WindowSpan([string]$text) {
-    if ($text -notmatch '^\s*(\d{1,2}):(\d{2})\s*-\s*(\d{1,2}):(\d{2})\s*$') { throw "Window '$text' is not HH:mm-HH:mm, for example 20:00-03:00." }
-    $h1 = [int]$Matches[1]; $m1 = [int]$Matches[2]; $h2 = [int]$Matches[3]; $m2 = [int]$Matches[4]
-    if ($h1 -gt 23 -or $h2 -gt 23 -or $m1 -gt 59 -or $m2 -gt 59) { throw "Window '$text' has an impossible time." }
-    $from = New-TimeSpan -Hours $h1 -Minutes $m1; $to = New-TimeSpan -Hours $h2 -Minutes $m2
-    if ($from -eq $to) { throw "Window '$text' starts and ends at the same time." }
-    [pscustomobject]@{ from = $from; to = $to; text = '{0:00}:{1:00}-{2:00}:{3:00}' -f $h1, $m1, $h2, $m2 }
+# "20:00" -> the next time the clock reads 20:00 (today, or tomorrow when it has passed), with its UTC offset ("o" format).
+# Also takes the "20:00-03:00" of the old -Window (the end is ignored). Checked before anything is written.
+function ConvertTo-StartTime([string]$text) {
+    if ($text -notmatch '^\s*(\d{1,2}):(\d{2})\s*(-.*)?$') { throw "'$text' is not a time of day, use HH:mm, for example 20:00." }
+    $h = [int]$Matches[1]; $m = [int]$Matches[2]
+    if ($h -gt 23 -or $m -gt 59) { throw "'$text' is not a possible time." }
+    $t = (Get-Date).Date.AddHours($h).AddMinutes($m)
+    if ($t -le (Get-Date)) { $t = $t.AddDays(1) }
+    ([DateTimeOffset]$t).ToString('o')   # offset of that day, also across a daylight saving change
 }
-if ($Window) {
-    try { $Window = (ConvertTo-WindowSpan $Window).text }
+if (-not $After -and $Window) { $After = $Window }
+$StartAt = ''   # the -After moment, '' = no waiting
+if ($After) {
+    try { $StartAt = ConvertTo-StartTime $After }
     catch {
         try { [Console]::ForegroundColor = 'Red' } catch { }
         [Console]::WriteLine("REFUSED: $($_.Exception.Message) Nothing was changed, you can close this window.")
@@ -113,40 +116,29 @@ if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administra
 
 $version  = if ($PSCommandPath) { (Get-FileHash $PSCommandPath -Algorithm SHA256).Hash.Substring(0, 12) } else { 'inline' }
 
-function New-State { [pscustomobject]@{ runId = [guid]::NewGuid().ToString(); phase = ''; attempts = 0; reboots = 0; isoFails = 0; forceBypass = $false; window = "$Window" } }
+function New-State { [pscustomobject]@{ runId = [guid]::NewGuid().ToString(); phase = ''; attempts = 0; reboots = 0; isoFails = 0; forceBypass = $false; after = "$StartAt" } }
 function Save-State { $state | ConvertTo-Json | Set-Content $stateFile }
 $state = $null
 try { $state = Get-Content $stateFile -Raw | ConvertFrom-Json } catch { }
 if (-not $state -or -not $Worker) { $state = New-State }
-if ($state.window) { $Window = $state.window }   # the task and SetupComplete.cmd run without the parameter
+if ($state.after) { $StartAt = $state.after }   # the task and SetupComplete.cmd run without the parameter
+# state.json from older versions has a window instead, it is ignored: the run then no longer waits.
 
-# Local time of this PC. Empty window = always open.
-function Test-WindowOpen {
-    if (-not $Window) { return $true }
-    $w = ConvertTo-WindowSpan $Window
-    $now = (Get-Date).TimeOfDay
-    if ($w.from -lt $w.to) { $now -ge $w.from -and $now -lt $w.to } else { $now -ge $w.from -or $now -lt $w.to }
+# The -After moment, $null without it. In PowerShell 7 ConvertFrom-Json already returns a DateTime.
+function Get-StartTime {
+    if (-not $StartAt) { return $null }
+    if ($StartAt -is [datetime]) { return [DateTimeOffset]$StartAt }
+    [DateTimeOffset]::Parse("$StartAt", [Globalization.CultureInfo]::InvariantCulture)
 }
+function Test-StartReached { $t = Get-StartTime; -not $t -or [DateTimeOffset]::Now -ge $t }
 
-# Minutes until the window closes, 0 while it is closed.
-function Get-WindowLeft {
-    if (-not (Test-WindowOpen)) { return 0 }
-    $w = ConvertTo-WindowSpan $Window
-    (($w.to - (Get-Date).TimeOfDay).TotalMinutes + 1440) % 1440
-}
-
-# Blocks until the window is open. Called before setup and before every reboot, never during setup.
-# A reboot passes $minutes: it only starts with that much of the window left (the whole window when it is shorter),
-# because Windows restarts a few more times by itself after it. Otherwise it waits for the next window and the PC
-# stays on, usable, without any restart from this script.
-function Wait-Window([string]$before, [int]$minutes = 0) {
-    if (-not $Window) { return }
-    $w = ConvertTo-WindowSpan $Window
-    $need = [math]::Max(1, [math]::Min($minutes, (($w.to - $w.from).TotalMinutes + 1440) % 1440))
-    if ((Get-WindowLeft) -ge $need) { return }
-    Log "Waiting for the window $Window (PC time)$(if ($minutes) { " with at least $need minutes of it left" }) before $before. The PC can be used meanwhile."
-    while ((Get-WindowLeft) -lt $need) { Start-Sleep -Seconds 30 }
-    Log "Window $Window is open, continuing."
+# Blocks until the -After time. Called before setup and before every reboot, never during setup.
+function Wait-Start([string]$before) {
+    if (Test-StartReached) { return }
+    $at = (Get-StartTime).ToLocalTime().ToString('HH:mm')
+    Log "Waiting until $at (PC time) before $before. The PC can be used meanwhile."
+    while (-not (Test-StartReached)) { Start-Sleep -Seconds 30 }
+    Log "It is $at, continuing."
 }
 
 # Waits for a process and logs a line every 5 minutes, with the text $detail returns.
@@ -196,7 +188,7 @@ function Register-WorkerTask {
     $trigger  = New-ScheduledTaskTrigger -AtStartup   # runs at boot as SYSTEM, nobody needs to sign in
     $trigger.Delay = 'PT2M'
     $runAs    = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
-    $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -ExecutionTimeLimit (New-TimeSpan -Hours 72)   # a window can add most of a day of waiting
+    $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -ExecutionTimeLimit (New-TimeSpan -Hours 72)   # -After can add most of a day of waiting
     Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger -Principal $runAs -Settings $settings -Force | Out-Null
 }
 
@@ -442,7 +434,7 @@ function Invoke-Repair {
 }
 
 function Restart-Now([string]$why) {
-    Wait-Window 'the reboot' $RebootLead
+    Wait-Start 'the reboot'
     Log "Rebooting: $why"
     Restart-Computer -Force
     exit 0
@@ -784,8 +776,8 @@ function Invoke-Worker {
     }
     if ($ready.verdict -eq 'BLOCKED') { Stop-Run 'failed' "Blocked: $($ready.blockers -join ', ')" }
 
-    # With a closed window the reboot waits until after the download, so the download starts right away.
-    $pendingDone = Test-WindowOpen
+    # Before the -After time the reboot waits until after the download, so the download starts right away.
+    $pendingDone = Test-StartReached
     if ($pendingDone) { Invoke-PendingReboot $ready }
 
     while ($true) {
@@ -803,15 +795,13 @@ function Invoke-Worker {
     if (-not $pendingDone) { Invoke-PendingReboot $ready }
 
     while ($true) {
-        Wait-Window 'starting setup'
+        Wait-Start 'starting setup'
         $state.attempts++; Save-State
         $bypass = $ready.verdict -eq 'BYPASS' -or $state.forceBypass
         Log "Setup attempt $($state.attempts) of $MaxAttempts$(if ($bypass) { ', with the unsupported hardware bypass' })$(if (Test-Media) { ', from the catalog media' })."
         $exit = Invoke-Setup $ready $bypass ($state.attempts -gt 1)
         $code = '0x{0:X8}' -f $exit
         if ($exit -eq 0) {
-            # before phase is set: a reboot while waiting must not look like a rollback
-            Wait-Window 'the restart that finishes the upgrade (restarting the PC yourself does the same)' $RebootLead
             $state.phase = 'setup-done'; Save-State
             Restart-Now 'Setup finished, the in-place upgrade completes during this reboot.'
         }
@@ -857,7 +847,8 @@ if (-not $Worker) {
     try { [Console]::ResetColor() } catch { }
     Log "==== Start on $env:COMPUTERNAME as $([Environment]::UserName), version $version ===="
     Remove-Item $report, "$dir\bugreport.zip" -Force -ErrorAction SilentlyContinue   # from an earlier run
-    if ($Window) { Log "Window $Window (PC time): setup and reboots only start inside it." }
+    if ($Window) { Log "-Window is replaced by -After: setup starts from $($Window.Split('-')[0].Trim()) (PC time), there is no end time any more." }
+    if ($StartAt) { Log "Setup and reboots wait until $((Get-StartTime).ToLocalTime().ToString('ddd dd-MM HH:mm', [Globalization.CultureInfo]::InvariantCulture)) (PC time)." }
     try {
         $task = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
         if ($task) {
