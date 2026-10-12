@@ -222,7 +222,29 @@ function Get-CompatBlocks {
             }
         } catch { }
     }
+    $blocks = @($blocks | Select-Object -Unique)
+    if ($blocks) {   # an app block gets the version and path the appraiser found for it, one line per file
+        $details = @(Get-BlockDetails)
+        $blocks = @(foreach ($b in $blocks) { $m = @($details | Where-Object { $_.StartsWith("$b ") }); if ($m) { $m } else { $b } })
+    }
     $blocks | Select-Object -Unique
+}
+
+# Blocked apps in setup's appraiser report (assets with BlockUpgrade TRUE): "Some Agent 1.2.3 (c:\program files\vendor\agent.exe)".
+function Get-BlockDetails {
+    Get-ChildItem "$bt\Panther" -Filter '*APPRAISER_HumanReadable.xml' -ErrorAction SilentlyContinue | ForEach-Object {
+        try {
+            $doc = [xml](Get-Content $_.FullName -Raw)
+            foreach ($a in $doc.SelectNodes("//*[local-name()='Asset'][.//*[local-name()='Property'][@Name='BlockUpgrade'][@Value='TRUE']]")) {
+                $p = @{}
+                foreach ($n in $a.SelectNodes(".//*[local-name()='Property']")) { $k = $n.GetAttribute('Name'); if (-not $p.ContainsKey($k)) { $p[$k] = $n.GetAttribute('Value') } }
+                $name = @($p.SdbAppName, $p.AppName, $p.Name, $p.DriverName) | Where-Object { $_ } | Select-Object -First 1
+                $ver = @($p.BinFileVersion, $p.Version, $p.DriverVerVersion) | Where-Object { $_ } | Select-Object -First 1
+                $path = @($p.LowerCaseLongPath, $p.RootDirPath) | Where-Object { $_ } | Select-Object -First 1
+                "$name $ver".Trim() + $(if ($path) { " ($path)" })
+            }
+        } catch { }
+    } | Select-Object -Unique
 }
 
 # Boot layout of the system disk: what a cloned disk tends to leave behind. Read-only. Every check has its
