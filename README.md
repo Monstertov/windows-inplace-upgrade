@@ -142,7 +142,8 @@ is the next morning. Pick a time early enough that it is done before people star
 4. Runs `setup.exe /auto upgrade`, an in-place upgrade that keeps apps, files and settings. If keeping them is
    not possible, setup stops and changes nothing. It never does a clean install.
 5. Reboots and finishes the upgrade. If setup fails or rolls back, it repairs Windows (DISM, sfc) and tries
-   again, up to 3 attempts.
+   again, up to 3 attempts. An app or driver that setup names as blocking stops it after the first attempt:
+   retrying does not lift that block.
 6. Removes its own scheduled task and the downloaded media when Windows 11 is running or when it gives up.
 
 Nothing is sent anywhere. Everything stays on the PC, only downloads from GitHub and Microsoft happen.
@@ -191,7 +192,7 @@ A log line starting with `FAILED:` names the reason, followed by where to look. 
 
 | Log says | Meaning | What to do |
 |---|---|---|
-| `Blocking: ...` or `0xC1900208` | An app or driver blocks the upgrade. Nothing is uninstalled for you. | Update or uninstall the named app or driver, run again. |
+| `Blocking: ...` or `0xC1900208` | An app or driver blocks the upgrade. Nothing is uninstalled for you. | Update or uninstall the named app or driver (security software usually from its own management console), run again. |
 | `0xC190020E`, `0x80070070` | Not enough disk space. | Free space (30 GB or more), run again. |
 | `0xC1900204`, `0xC1900215` | The install media has no image for this edition and language. | Not fixable by retrying. Only Dutch and English are supported. |
 | `Install media not ready` | Neither the ISO nor the Media Creation Tool catalog gave a download, the download broke, or building the media failed. | Check the internet and that `microsoft.com` is reachable. For a DISM error, see `C:\Windows\Logs\DISM\dism.log`. It retries 12 times, waiting 1, 2, 5, 10 and 15 minutes at first, then 30 minutes. Microsoft limits repeated requests from one address, so many PCs behind one IP can slow each other down. |

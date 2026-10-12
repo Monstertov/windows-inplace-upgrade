@@ -214,8 +214,11 @@ function Get-CompatBlocks {
     $blocks = @()
     Get-ChildItem "$bt\Panther" -Filter 'CompatData*.xml' -ErrorAction SilentlyContinue | ForEach-Object {
         try {
-            ([xml](Get-Content $_.FullName -Raw)).SelectNodes("//*[CompatibilityInfo[@BlockingType='Hard']]") | ForEach-Object {
-                $blocks += ('{0} {1}{2}' -f $_.LocalName, $_.GetAttribute('Name'), $_.GetAttribute('InfPath')).Trim()
+            # CompatData has a default namespace, so match by local-name(). An app block names the app in Title.
+            ([xml](Get-Content $_.FullName -Raw)).SelectNodes("//*[local-name()='CompatibilityInfo'][@BlockingType='Hard']") | ForEach-Object {
+                $p = $_.ParentNode
+                $blocks += if ($_.GetAttribute('Title')) { $_.GetAttribute('Title') }
+                           else { ('{0} {1}{2}' -f $p.LocalName, $p.GetAttribute('Name'), $p.GetAttribute('InfPath')).Trim() }
             }
         } catch { }
     }
@@ -373,8 +376,7 @@ function Get-Readiness {
         tpm = if ($tpm) { ($tpm.SpecVersion -split ',')[0].Trim() } else { 'none' }
         firmware = $env:firmware_type; secureBoot = $secureBoot; ramGB = $ramGB
         diskGB = [math]::Round($sysVol.Size / 1GB); freeGB = [math]::Round($sysVol.FreeSpace / 1GB)
-        pendingReboot = (Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending') -or
-                        (Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired')
+        pendingReboot = Test-PendingReboot
     }
     # ponytail: Intel Core generation from the model number only, no full Microsoft CPU list.
     # Anything else reports 'check' and gets the bypass, which is harmless on supported CPUs.
@@ -706,7 +708,14 @@ function Invoke-Setup($ready, [bool]$bypass, [bool]$dynamicUpdate) {
     if ($fromEsd) { $root = $media; Log "Using the install media built from the catalog in $media." }
     else {
         Dismount-DiskImage -ImagePath $iso -ErrorAction SilentlyContinue | Out-Null   # stale mount from a killed run
-        $root = "$((Mount-DiskImage -ImagePath $iso -PassThru | Get-Volume).DriveLetter):"
+        $img = Mount-DiskImage -ImagePath $iso -PassThru
+        # The drive letter can come a few seconds after the mount (a second mount once got none at all).
+        for ($i = 0; $i -lt 15 -and -not ($letter = ($img | Get-Volume).DriveLetter); $i++) { Start-Sleep -Seconds 2 }
+        if (-not $letter) {
+            $state.attempts--; Save-State   # setup did not run, so this does not count as an attempt
+            throw 'The ISO was mounted but Windows gave it no drive letter.'
+        }
+        $root = "${letter}:"
         Log "ISO mounted on $root"
     }
     try {
@@ -743,8 +752,14 @@ function Invoke-Setup($ready, [bool]$bypass, [bool]$dynamicUpdate) {
     }
 }
 
-function Invoke-PendingReboot($ready) {
-    if (-not $ready.pendingReboot) { return }
+function Test-PendingReboot {
+    (Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending') -or
+    (Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired')
+}
+
+# Checks the registry itself: Windows Update or a repair can ask for a reboot after the readiness check.
+function Invoke-PendingReboot {
+    if (-not (Test-PendingReboot)) { return }
     if ($state.reboots -lt 2) { $state.reboots++; Save-State; Restart-Now 'Windows has a pending reboot, setup needs a clean start.' }
     Log 'Reboot still pending after 2 reboots, continuing anyway.'
 }
@@ -775,9 +790,8 @@ function Invoke-Worker {
     }
     if ($ready.verdict -eq 'BLOCKED') { Stop-Run 'failed' "Blocked: $($ready.blockers -join ', ')" }
 
-    # Before the -After time the reboot waits until after the download, so the download starts right away.
-    $pendingDone = Test-StartReached
-    if ($pendingDone) { Invoke-PendingReboot $ready }
+    # Before the -After time the reboot waits until just before setup, so the download starts right away.
+    if (Test-StartReached) { Invoke-PendingReboot }
 
     while ($true) {
         try { Get-Iso $ready.lang $ready.edition; break }
@@ -791,10 +805,10 @@ function Invoke-Worker {
             Start-Sleep -Seconds $wait
         }
     }
-    if (-not $pendingDone) { Invoke-PendingReboot $ready }
 
     while ($true) {
         Wait-Start 'starting setup'
+        Invoke-PendingReboot   # Windows Update during the wait, or the repair after a failed attempt
         $state.attempts++; Save-State
         $bypass = $ready.verdict -eq 'BYPASS' -or $state.forceBypass
         Log "Setup attempt $($state.attempts) of $MaxAttempts$(if ($bypass) { ', with the unsupported hardware bypass' })$(if (Test-Media) { ', from the catalog media' })."
@@ -823,6 +837,8 @@ function Invoke-Worker {
         Write-SetupErrors
 
         if ($code -in '0xC1900204', '0xC1900215', '0xC1900104') { Stop-Run 'failed' "Setup $code, $($known[$code])." }
+        # A named app block stays until someone updates or removes that app: retrying and repair do not change it.
+        if ($code -eq '0xC1900208' -and $blocks) { Stop-Run 'failed' "Setup $code, blocked by: $($blocks -join '; ')." }
         if ($state.attempts -ge $MaxAttempts) { Stop-Run 'failed' "Setup failed $($state.attempts) times, last $code." }
         switch ($code) {
             { $_ -in '0xC1900200', '0xC1900202' } { $state.forceBypass = $true; Save-State }
